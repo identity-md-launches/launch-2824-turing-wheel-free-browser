@@ -21,6 +21,7 @@ const POLL_MS = 5_000;
 const HIDDEN_POLL_MS = 60_000;
 const MAX_BACKOFF_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 8_000;
+const FAILED_POLLS_TO_LOSE_SIGNAL = 2;
 const SCHEDULE_POLL_MS = 60_000;
 const SCHEDULE_RETRY_MS = 10 * 60_000;
 
@@ -185,8 +186,8 @@ export function createHamsterClock(options: HamsterClockOptions = {}): HamsterCl
     polling = false;
     if (stopped) return;
     const at = now();
-    linkDown = telemetry === null;
     failures = telemetry === null ? failures + 1 : 0;
+    linkDown = failures >= FAILED_POLLS_TO_LOSE_SIGNAL;
     if (telemetry !== null) {
       if (telemetry.generatedAt !== null) skewMs = telemetry.generatedAt - at;
       accept(telemetry, at);

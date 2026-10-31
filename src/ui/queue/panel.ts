@@ -13,6 +13,7 @@ import { h, setText } from '../dom';
 import { cycles, shortAddress } from '../format';
 import { createFramePainter, type ThumbHandle, type ThumbPool } from '../led/thumbs';
 import { BLUE_STOPS, GOLD_STOPS, css, type Rgb } from '../led/palette';
+import { PROGRAM_HIDDEN, SOURCE_WITHHELD, isHidden, isWithheld } from '../moderation';
 import { history, upcoming, type SliceView } from './slices';
 
 type Tab = 'next' | 'past';
@@ -41,6 +42,8 @@ export interface QueuePanel {
   setReplayActive(active: boolean): void;
   setSqueeked(programId: number): void;
   setSqueeking(programId: number, busy: boolean): void;
+  /** What the contract says this wallet has squeeked, replacing anything known before. */
+  setSqueekedIds(programIds: ReadonlySet<number>): void;
   /** Keeps the chosen frame in view while the wall is scrolled away. */
   monitor(frame: Frame): void;
 }
@@ -48,8 +51,17 @@ export interface QueuePanel {
 interface Card {
   readonly element: HTMLElement;
   readonly eta: HTMLElement;
-  readonly thumb: ThumbHandle;
+  /** Null for a hidden program, which gets no pixels at all. */
+  readonly thumb: ThumbHandle | null;
   readonly slice: SliceView;
+}
+
+/** The reader keeps a program's object while nothing about it changed, squeeks included. */
+function unchanged(before: SliceView, after: SliceView): boolean {
+  if (before.end !== after.end) return false;
+  const was = before.slot.kind === 'queued' ? before.slot.program : null;
+  const now = after.slot.kind === 'queued' ? after.slot.program : null;
+  return was === now;
 }
 
 function paintFilm(canvas: HTMLCanvasElement, program: Program): void {
@@ -95,7 +107,7 @@ export function createQueuePanel(
   let order = '';
   let work = 0;
   let known = false;
-  const squeeked = new Set<number>();
+  let squeeked: ReadonlySet<number> = new Set<number>();
   const squeeking = new Set<number>();
 
   const summary = h('span', { class: 'bar__sub' }, 'READING SEPOLIA');
@@ -175,15 +187,17 @@ export function createQueuePanel(
   const buildCard = (slice: SliceView, position: number): Card => {
     const { slot } = slice;
     const live = position === 0 && tab === 'next';
-    const canvas = h('canvas', { class: 'card__led', 'aria-hidden': 'true' });
-    const thumb = pool.add(canvas, programOf(slice.source), 2.4);
+    const hidden = slot.kind === 'queued' && isHidden(slot.program.id);
+    const withheld = !hidden && slot.kind === 'queued' && isWithheld(slice.source);
+    const canvas = hidden ? null : h('canvas', { class: 'card__led', 'aria-hidden': 'true' });
+    const thumb = canvas ? pool.add(canvas, programOf(slice.source), 2.4) : null;
     const eta = h('span', { class: 'card__eta' }, '');
     const title = slot.kind === 'queued' ? `#${slot.program.id}` : slot.name;
     const byline = slot.kind === 'queued' ? shortAddress(slot.program.author) : 'HOUSE ROM';
     const label = slot.kind === 'queued' ? `PROGRAM #${slot.program.id}` : `HOUSE ROM: ${slot.name}`;
 
     const actions: HTMLElement[] = [];
-    if (slot.kind === 'queued') {
+    if (slot.kind === 'queued' && !hidden) {
       const id = slot.program.id;
       actions.push(
         h(
@@ -195,11 +209,15 @@ export function createQueuePanel(
             'aria-label': `Squeek program ${id}, ${slot.program.squeeks} squeeks so far`,
             onClick: () => events.onSqueek(id),
           },
-          squeeking.has(id) ? 'Waiting for block' : `Squeek ${slot.program.squeeks}`,
+          squeeking.has(id)
+            ? 'Waiting for block'
+            : squeeked.has(id)
+              ? `Squeeked ${slot.program.squeeks}`
+              : `Squeek ${slot.program.squeeks}`,
         ),
       );
     }
-    if (tab === 'past') {
+    if (tab === 'past' && !hidden) {
       actions.push(
         h('button', { class: 'btn btn--small', type: 'button', onClick: () => openReplay(slice, label) }, 'Replay'),
       );
@@ -208,7 +226,7 @@ export function createQueuePanel(
     const element = h(
       'article',
       { class: 'card', role: 'listitem', 'data-kind': slot.kind, 'data-live': live ? 'true' : 'false' },
-      h('div', { class: 'card__screen' }, canvas),
+      h('div', { class: 'card__screen', 'data-redacted': hidden ? 'true' : 'false' }, canvas ?? PROGRAM_HIDDEN),
       h(
         'div',
         { class: 'card__body' },
@@ -220,7 +238,9 @@ export function createQueuePanel(
         ),
         h('h3', { class: 'card__title' }, title),
         h('p', { class: 'card__by' }, byline),
-        h('code', { class: 'card__source', title: slice.source }, slice.source),
+        hidden ? null : withheld
+          ? h('p', { class: 'card__source' }, SOURCE_WITHHELD)
+          : h('code', { class: 'card__source', title: slice.source }, slice.source),
         actions.length > 0 ? h('div', { class: 'card__actions' }, ...actions) : null,
       ),
     );
@@ -279,15 +299,15 @@ export function createQueuePanel(
       const nextCards = new Map<string, Card>();
       slices.forEach((slice, position) => {
         const card = cards.get(slice.key);
-        if (card && card.slice.end === slice.end && position !== 0 && tab === 'next') {
+        if (card && unchanged(card.slice, slice) && position !== 0 && tab === 'next') {
           nextCards.set(slice.key, card);
         } else {
-          card?.thumb.remove();
+          card?.thumb?.remove();
           nextCards.set(slice.key, buildCard(slice, position));
         }
       });
       for (const [key, card] of cards) {
-        if (!nextCards.has(key)) card.thumb.remove();
+        if (!nextCards.has(key)) card.thumb?.remove();
       }
       cards = nextCards;
       track.replaceChildren(...[...cards.values()].map((card) => card.element));
@@ -333,6 +353,14 @@ export function createQueuePanel(
     filmPanel,
   );
 
+  /** Button state lives in the cards, so a change to it needs new ones. */
+  const rebuild = (): void => {
+    for (const card of cards.values()) card.thumb?.remove();
+    cards = new Map();
+    order = '';
+    refresh();
+  };
+
   let lastTick = 0;
 
   return {
@@ -362,17 +390,17 @@ export function createQueuePanel(
       if (!active) filmPanel.hidden = true;
     },
     setSqueeked(id) {
-      squeeked.add(id);
-      order = '';
-      refresh();
+      squeeked = new Set([...squeeked, id]);
+      rebuild();
     },
     setSqueeking(id, busy) {
       if (busy) squeeking.add(id);
       else squeeking.delete(id);
-      for (const card of cards.values()) card.thumb.remove();
-      cards = new Map();
-      order = '';
-      refresh();
+      rebuild();
+    },
+    setSqueekedIds(ids) {
+      squeeked = ids;
+      rebuild();
     },
   };
 }

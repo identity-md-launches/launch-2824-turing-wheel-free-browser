@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { COLS, ROWS } from '../../types';
 import { FONT_BANNER, FONT_MINI, FONT_PLAQUE, textWidth, type LedFont } from './font';
-import { ACQUIRING_LINES, FAULT_LINES, haltedLines, lostLines } from './plates';
+import { ACQUIRING_LINES, FAULT_LINES, REDACTED_LINES, haltedLines, lostLines } from './plates';
 import type { PlateLine } from './scene';
 
 const FONTS: Record<PlateLine['font'], LedFont> = { mini: FONT_MINI, banner: FONT_BANNER, plaque: FONT_PLAQUE };
@@ -14,6 +14,7 @@ const PLATES: readonly (readonly [string, readonly PlateLine[]])[] = [
   ['never seen', lostLines(false)],
   ['fault', FAULT_LINES],
   ['acquiring', ACQUIRING_LINES],
+  ['redacted', REDACTED_LINES],
 ];
 
 describe('led plates', () => {

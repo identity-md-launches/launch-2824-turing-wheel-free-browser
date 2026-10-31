@@ -1,5 +1,6 @@
-import { COLS, ROWS } from '../../types';
+import { CELLS, COLS, ROWS, type Frame } from '../../types';
 import { createCanvasSurface } from './canvas2d';
+import { createFlashGuard } from './flash-guard';
 import { createGlSurface } from './gl';
 import { createPhosphor } from './phosphor';
 import type { LedSurface } from './surface';
@@ -15,28 +16,26 @@ export interface LedWall {
   /** Fits the lattice inside the given CSS box and returns the size it took. */
   fit(cssWidth: number, cssHeight: number): { readonly width: number; readonly height: number };
   present(targets: Float32Array, dtMs: number, power: number): void;
+  /** Keeps the phosphor and flash guard running while the wall itself is off screen. */
+  advance(targets: Float32Array, dtMs: number): void;
+  /** What is really lit, as levels. Anything small that mirrors the wall must read this, not raw frames. */
+  copyLevels(out: Frame): void;
+  isLimiting(): boolean;
   settle(targets: Float32Array): void;
   destroy(): void;
 }
 
-function pickSurface(canvas: HTMLCanvasElement, options: LedWallOptions, onLost: () => void): LedSurface {
-  const transparent = options.transparent ?? false;
-  if (!options.forceCanvas2d) {
-    const gl = createGlSurface(canvas, { transparent, onLost });
-    if (gl) return gl;
-  }
-  const flat = createCanvasSurface(canvas, { transparent });
-  if (flat) return flat;
-  throw new Error('No canvas context available');
-}
-
 export function createLedWall(host: HTMLCanvasElement, options: LedWallOptions = {}): LedWall {
   let canvas = host;
+  const transparent = options.transparent ?? false;
   const phosphor = createPhosphor();
+  const guard = createFlashGuard();
+  let shown = phosphor.heat;
+  let clockMs = 0;
   let lastSize = { pitch: 0, width: 0, height: 0 };
 
-  const fallBack = (): void => {
-    // A canvas that held a WebGL context can never return a 2D one, so swap the element.
+  /** A canvas that ever held a WebGL context can never return a 2D one, so swap the element. */
+  const flatSurface = (): LedSurface => {
     const next = document.createElement('canvas');
     next.className = canvas.className;
     next.setAttribute('role', canvas.getAttribute('role') ?? 'img');
@@ -44,14 +43,24 @@ export function createLedWall(host: HTMLCanvasElement, options: LedWallOptions =
     next.style.cssText = canvas.style.cssText;
     canvas.replaceWith(next);
     canvas = next;
-    const flat = createCanvasSurface(next, { transparent: options.transparent ?? false });
-    if (flat) {
-      surface = flat;
-      surface.resize(lastSize.width, lastSize.height, lastSize.pitch);
-    }
+    const flat = createCanvasSurface(next, { transparent });
+    if (!flat) throw new Error('No canvas context available');
+    return flat;
   };
 
-  let surface = pickSurface(canvas, options, fallBack);
+  const fallBack = (): void => {
+    surface = flatSurface();
+    surface.resize(lastSize.width, lastSize.height, lastSize.pitch);
+  };
+
+  const step = (targets: Float32Array, dtMs: number): void => {
+    clockMs += dtMs;
+    phosphor.step(targets, dtMs);
+    shown = guard.apply(phosphor.heat, clockMs);
+  };
+
+  let surface: LedSurface =
+    (options.forceCanvas2d ? null : createGlSurface(canvas, { transparent, onLost: fallBack })) ?? flatSurface();
 
   return {
     get kind() {
@@ -72,9 +81,18 @@ export function createLedWall(host: HTMLCanvasElement, options: LedWallOptions =
       return size;
     },
     present(targets, dtMs, power) {
-      phosphor.step(targets, dtMs);
-      surface.draw(phosphor.heat, power);
+      step(targets, dtMs);
+      surface.draw(shown, power);
     },
+    advance: step,
+    copyLevels(out) {
+      for (let i = 0; i < CELLS; i++) {
+        const gold = shown[i * 2] as number;
+        const blue = shown[i * 2 + 1] as number;
+        out[i] = gold >= blue ? Math.round(gold * 4) : -Math.round(blue * 4);
+      }
+    },
+    isLimiting: () => guard.isLimiting(clockMs),
     settle(targets) {
       phosphor.settle(targets);
     },

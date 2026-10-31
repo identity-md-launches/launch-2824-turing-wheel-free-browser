@@ -2,6 +2,7 @@ export { TURING_WHEEL_ABI } from './abi';
 export { createHamsterClock, hasTelemetry } from './clock';
 export type { ClockVisibility, HamsterClockOptions } from './clock';
 export {
+  HIDDEN_PROGRAM_IDS,
   LIVE_SCHEDULE_URL,
   SEPOLIA_CHAIN_ID,
   SEPOLIA_EXPLORER_URL,
@@ -15,6 +16,7 @@ export { previewQueue } from './preview';
 export type { QueuePreview, QueuePreviewOptions } from './preview';
 export { createQueueReader } from './queue';
 export type { QueueReaderHandle, QueueReaderOptions } from './queue';
+export { readSqueeked } from './squeeked';
 export { createSimClock } from './sim-clock';
 export type { SimClockOptions } from './sim-clock';
 export { WalletError, isUserRejection, sourceProblem } from './wallet-errors';

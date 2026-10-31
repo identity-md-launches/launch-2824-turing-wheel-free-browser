@@ -84,13 +84,15 @@ interface Entry {
   program: Program;
   rate: number;
   visible: boolean;
-  fresh: boolean;
+  drawnAt: number;
 }
 
 const PER_TICK = 2;
+/** Four updates a second cannot make more than two flashes, whatever a program does. */
+const MIN_UPDATE_MS = 250;
 
 /** Thumbnails take turns so a long queue never costs the wall a frame. */
-export function createThumbPool(): ThumbPool {
+export function createThumbPool(reduced: boolean): ThumbPool {
   const entries: Entry[] = [];
   const scratch = createFrame();
   let cursor = 0;
@@ -103,9 +105,10 @@ export function createThumbPool(): ThumbPool {
   });
 
   const draw = (entry: Entry, now: number): void => {
-    entry.program.render((now / 1000) * entry.rate, scratch);
+    const t = (now / 1000) * entry.rate;
+    entry.program.render(reduced ? Math.floor(t) : t, scratch);
     entry.painter.paint(scratch);
-    entry.fresh = true;
+    entry.drawnAt = now;
   };
 
   return {
@@ -116,7 +119,7 @@ export function createThumbPool(): ThumbPool {
         program,
         rate,
         visible: true,
-        fresh: false,
+        drawnAt: 0,
       };
       entries.push(entry);
       observer.observe(canvas);
@@ -124,7 +127,6 @@ export function createThumbPool(): ThumbPool {
       return {
         setProgram(next) {
           entry.program = next;
-          entry.fresh = false;
         },
         remove() {
           observer.unobserve(canvas);
@@ -139,7 +141,7 @@ export function createThumbPool(): ThumbPool {
       for (let seen = 0; seen < entries.length && drawn < PER_TICK; seen++) {
         cursor = (cursor + 1) % entries.length;
         const entry = entries[cursor];
-        if (!entry || !entry.visible) continue;
+        if (!entry || !entry.visible || now - entry.drawnAt < MIN_UPDATE_MS) continue;
         draw(entry, now);
         drawn += 1;
       }

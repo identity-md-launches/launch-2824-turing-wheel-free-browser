@@ -28,6 +28,10 @@ export const FAULT_LINES: readonly PlateLine[] = [
   { text: 'CLOCK UNTRUSTED', font: 'mini', tone: 'ember', x: centred('mini', 'CLOCK UNTRUSTED'), y: 27 },
 ];
 
+export const REDACTED_LINES: readonly PlateLine[] = [
+  { text: 'REDACTED', font: 'banner', tone: 'ember', x: centred('banner', 'REDACTED'), y: 14 },
+];
+
 export const ACQUIRING_LINES: readonly PlateLine[] = [
   { text: 'ACQUIRING SIGNAL', font: 'mini', tone: 'ember', x: centred('mini', 'ACQUIRING SIGNAL'), y: 15 },
 ];

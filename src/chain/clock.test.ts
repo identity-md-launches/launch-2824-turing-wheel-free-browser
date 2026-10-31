@@ -280,8 +280,43 @@ describe('losing the signal', () => {
     expect(readNow(clock).state).toBe('running');
 
     respond = failure;
-    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(readNow(clock)).toMatchObject({ work: 700, hz: 0, rpm: 0, state: 'signal-lost', observedAt: T0 });
+  });
+
+  it('rides out one failed poll while the data is still good', async () => {
+    let respond: Responder = serving(() => ({ cumulativeWorkUnits: '700', coreStatus: 'ACTIVE', rpmMilli: 60_000 }));
+    const { clock } = harness((url, init) => respond(url, init));
+    await land();
+
+    respond = async () => {
+      throw new TypeError('Failed to fetch');
+    };
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(readNow(clock)).toMatchObject({ state: 'running', hz: 1, rpm: 60 });
+  });
+
+  it('counts failures in a row, so scattered blips never lose the signal', async () => {
+    const good = serving(() => ({ coreStatus: 'IDLE' }));
+    const bad: Responder = async () => jsonResponse({ error: 'boom' }, { status: 500 });
+    let respond = good;
+    const { clock } = harness((url, init) => respond(url, init));
+    await land();
+
+    const states = [];
+    for (const next of [bad, good, bad, good, bad]) {
+      respond = next;
+      await vi.advanceTimersByTimeAsync(5_000);
+      states.push(readNow(clock).state);
+    }
+    expect(states).toEqual(['asleep', 'asleep', 'asleep', 'asleep', 'asleep']);
+  });
+
+  it('still reads as no telemetry after one failure at first load', async () => {
+    const { clock } = harness(async () => jsonResponse({ error: 'boom' }, { status: 500 }));
+    await land();
+    expect(readNow(clock).state).toBe('signal-lost');
+    expect(hasTelemetry(readNow(clock))).toBe(false);
   });
 
   it.each(['stale', 'degraded'])('treats freshness %s as signal-lost and keeps the real counter', async (freshness) => {
@@ -373,7 +408,7 @@ describe('losing the signal', () => {
     await land();
 
     fixture = { provenance, cumulativeWorkUnits: '6000', coreStatus: 'ACTIVE', rpmMilli: 60_000 };
-    await vi.advanceTimersByTimeAsync(7_000);
+    await vi.advanceTimersByTimeAsync(12_000);
     expect(readNow(clock)).toMatchObject({ work: 50, hz: 0, state: 'signal-lost' });
   });
 });

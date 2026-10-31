@@ -13,7 +13,8 @@ import {
   type Slot,
 } from '../types';
 import { utcClock } from './format';
-import { ACQUIRING_LINES, FAULT_LINES, haltedLines, lostLines } from './led/plates';
+import { HIDDEN_SOURCE, isHidden, isWithheld } from './moderation';
+import { ACQUIRING_LINES, FAULT_LINES, REDACTED_LINES, haltedLines, lostLines } from './led/plates';
 import {
   applyStatic,
   applyWakeWave,
@@ -41,9 +42,12 @@ export interface DisplayInfo {
   readonly slot: Slot | null;
   readonly title: string;
   readonly byline: string;
-  /** The text of whatever is on the wall, broken or not. */
+  /** The text of whatever is on the wall. Empty when withheld or hidden, so nothing can leak it. */
   readonly text: string;
   readonly segfault: boolean;
+  /** A stranger's source that does not compile. Your own broken code stays visible to you. */
+  readonly withheld: boolean;
+  readonly hidden: boolean;
 }
 
 export interface MachineOptions {
@@ -81,6 +85,10 @@ const HALT_WIPE_MS = 320;
 const CRANK_IDLE_MS = 45000;
 const HELD_GAIN = 0.11;
 const ACQUIRE_GRACE_MS = 9000;
+/** The heartbeat is a brightness pulse per cycle, so it must stop where cycles could read as flashes. */
+const BEAT_MAX_HZ = 3;
+
+const REDACTED_PLATE = buildPlate(REDACTED_LINES);
 
 const cache = new Map<string, Program>();
 
@@ -117,7 +125,9 @@ function textOf(slot: Slot): string {
   return slot.kind === 'queued' ? slot.program.source : slot.source;
 }
 
-const isBroken = (text: string): boolean => text.length > 0 && !compile(text).ok;
+function isHiddenSlot(slot: Slot | null): boolean {
+  return slot?.kind === 'queued' && isHidden(slot.program.id);
+}
 
 export function createMachine(options: MachineOptions): Machine {
   const { wall, house, reduced } = options;
@@ -142,6 +152,8 @@ export function createMachine(options: MachineOptions): Machine {
   let crankLabel = '';
   let crankByline = '';
   let crankText = '';
+  let crankWithheld = false;
+  let crankHidden = false;
   let lastCrankAt = 0;
 
   let editorProgram: Program | null = null;
@@ -167,7 +179,7 @@ export function createMachine(options: MachineOptions): Machine {
   let raf = 0;
   let info: DisplayInfo = {
     source, scene: 'acquiring', hamsterScene: 'acquiring', reading: null, hz: 0, cycle: 0, t: 0,
-    slot: null, title: '', byline: '', text: '', segfault: false,
+    slot: null, title: '', byline: '', text: '', segfault: false, withheld: false, hidden: false,
   };
 
   const choosePlate = (scene: Scene, reading: HamsterReading | null): void => {
@@ -183,8 +195,13 @@ export function createMachine(options: MachineOptions): Machine {
     if (scene === 'acquiring') plate = buildPlate(ACQUIRING_LINES);
   };
 
-  const compose = (scene: Scene, now: number): void => {
+  const compose = (scene: Scene, hidden: boolean, now: number): void => {
     const sinceChange = now - sceneChangedAt;
+    if (hidden && scene === 'live') {
+      targets.fill(0);
+      stampPlate(REDACTED_PLATE, 1, targets);
+      return;
+    }
     if (scene === 'live') {
       const wake = (now - wakeAt) / WAKE_MS;
       if (!reduced && wake >= 0 && wake < 1) applyWakeWave(frame, wake, HELD_GAIN, targets);
@@ -238,7 +255,8 @@ export function createMachine(options: MachineOptions): Machine {
 
     // Work is a placeholder 0 until real telemetry lands, so the schedule must not run from it.
     const slot = reading && hasTelemetry(reading) ? resolveSlot(reading.work, queue, house) : null;
-    let program = slot ? programFor(textOf(slot)) : null;
+    const slotHidden = isHiddenSlot(slot);
+    let program = slot ? programFor(slotHidden ? HIDDEN_SOURCE : textOf(slot)) : null;
     let t = slot?.t ?? 0;
     let hz = reading?.hz ?? 0;
     let cycle = reading?.work ?? 0;
@@ -248,7 +266,8 @@ export function createMachine(options: MachineOptions): Machine {
       : slot.kind === 'queued'
         ? `BY ${slot.program.author.slice(0, 6)}...${slot.program.author.slice(-4)}`
         : 'HOUSE ROM';
-    let text = slot ? textOf(slot) : '';
+    let text = slot && !slotHidden ? textOf(slot) : '';
+    let hidden = slotHidden;
     let scene: Scene = hamsterScene;
 
     if (source === 'crank') {
@@ -259,6 +278,7 @@ export function createMachine(options: MachineOptions): Machine {
       title = crankLabel;
       byline = crankByline;
       text = crankText;
+      hidden = crankHidden;
       scene = 'live';
     } else if (source === 'bench') {
       benchT += (dt / 1000) * benchHz;
@@ -269,6 +289,7 @@ export function createMachine(options: MachineOptions): Machine {
       title = 'YOUR PROGRAM';
       byline = 'LOCAL TO THIS SCREEN';
       text = editorText;
+      hidden = false;
       scene = 'live';
     } else if (source === 'replay') {
       program = replayProgram;
@@ -278,13 +299,15 @@ export function createMachine(options: MachineOptions): Machine {
       title = replayLabel;
       byline = 'REPLAYED LOCALLY';
       text = replayText;
+      hidden = false;
       scene = 'live';
     }
 
     if (text !== brokenText) {
       brokenText = text;
-      broken = isBroken(text);
+      broken = isWithheld(text);
     }
+    const withheld = source === 'crank' ? crankWithheld : source !== 'bench' && broken;
 
     if (reduced) t = Math.floor(t);
     shownProgram = program;
@@ -303,16 +326,26 @@ export function createMachine(options: MachineOptions): Machine {
       renderedT = t;
     }
 
+    choosePlate(scene, reading);
+    compose(scene, hidden, now);
     if (onScreen) {
-      choosePlate(scene, reading);
-      compose(scene, now);
       const wake = (now - wakeAt) / WAKE_MS;
       const surge = !reduced && scene === 'live' && wake >= 0 && wake < 1 ? 0.2 * Math.exp(-wake * 4.5) : 0;
-      const beat = !reduced && scene === 'live' && hz > 0.15 ? 0.03 * Math.exp(-(t - whole) * 7) : 0;
+      const beat = !reduced && scene === 'live' && hz > 0.15 && hz <= BEAT_MAX_HZ
+        ? 0.03 * Math.exp(-(t - whole) * 7)
+        : 0;
       wall.present(targets, dt, 1 + surge + beat);
+    } else {
+      wall.advance(targets, dt);
     }
 
-    info = { source, scene, hamsterScene, reading, hz, cycle, t, slot, title, byline, text, segfault: broken };
+    info = {
+      source, scene, hamsterScene, reading, hz, cycle, t, slot, title, byline,
+      text: withheld ? '' : text,
+      segfault: broken || withheld,
+      withheld,
+      hidden,
+    };
     options.afterFrame(frame, info, dt, now);
   };
 
@@ -350,7 +383,9 @@ export function createMachine(options: MachineOptions): Machine {
       crankT = Number.isNaN(shownT) ? 0 : shownT;
       crankLabel = fromBench ? 'YOUR PROGRAM' : info.title || 'YOUR PROGRAM';
       crankByline = fromBench ? 'LOCAL TO THIS SCREEN' : info.byline || 'LOCAL TO THIS SCREEN';
-      crankText = fromBench ? editorText : info.text || editorText;
+      crankText = fromBench ? editorText : info.text;
+      crankWithheld = !fromBench && info.withheld;
+      crankHidden = !fromBench && info.hidden;
       source = 'crank';
     },
     turnCrank(delta) {
@@ -368,6 +403,8 @@ export function createMachine(options: MachineOptions): Machine {
         crankLabel = 'YOUR PROGRAM';
         crankByline = 'LOCAL TO THIS SCREEN';
         crankText = text;
+        crankWithheld = false;
+        crankHidden = false;
         lastCrankAt = performance.now();
         return;
       }

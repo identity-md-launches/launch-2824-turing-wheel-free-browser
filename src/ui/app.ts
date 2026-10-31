@@ -4,7 +4,7 @@ import type { QueueReaderHandle } from '../chain/queue';
 import { WalletError, isUserRejection, sourceProblem } from '../chain/wallet-errors';
 import { HOUSE_ROM, PRESETS } from '../machine/presets';
 import { frameToCover } from '../machine/cover';
-import type { Frame, HamsterClock, QueuedProgram, WalletSession } from '../types';
+import { createFrame, type Frame, type HamsterClock, type QueuedProgram, type WalletSession } from '../types';
 import { createRelay } from './audio';
 import { copyText, helpTip, lamp, segmented, toastHost, type Segmented } from './chrome';
 import { createCrankPanel } from './crank/panel';
@@ -15,6 +15,7 @@ import { createThumbPool } from './led/thumbs';
 import { createLedWall } from './led/wall';
 import { createLockup, createWheelMark } from './lockup';
 import { createMachine, programFor, type ClockSource, type DisplayInfo, type Scene } from './machine';
+import { PROGRAM_HIDDEN, SOURCE_WITHHELD, isWithheld } from './moderation';
 import { createQueuePanel, type QueueSync } from './queue/panel';
 import { describeTerms, queueTerms } from './queue/terms';
 import { createRail } from './rail';
@@ -25,16 +26,24 @@ const STARTER = 'sin(r*.45-t*.8+a*3)*cos(u*.12+t*.3)';
 const WAKE_THEATRE_MS = 1600;
 const FIRST_READ_GRACE_MS = 12000;
 const PREVIEW_REFRESH_MS = 30000;
+/** Three missed polls of the queue reader. Past this, a list that looks empty is only old. */
+const QUEUE_STALE_MS = 90000;
+/** Longer than a wallet prompt plus the 5 minute wait for a receipt, so only a hung wallet reaches it. */
+const WALLET_PATIENCE_MS = 11 * 60000;
+const SQUEEKED_CHECK_LIMIT = 8;
 const GLOW_GAIN = 1.5;
 const HAPTIC_MAX_HZ = 1.2;
 const PHONE_LOCKUP_MAX = 116;
 const PHONE_HEADLINE_WIDTH = 252;
 
-function statusOf(info: DisplayInfo): { text: string; tone: string } {
+function statusOf(info: DisplayInfo, sync: QueueSync): { text: string; tone: string } {
   const everSeen = (info.reading?.observedAt ?? 0) > 0;
   const hamster = hamsterStatus(info.hamsterScene, everSeen);
   switch (info.source) {
     case 'hamster':
+      if (info.hamsterScene === 'live' && (sync === 'reading' || sync === 'unreachable')) {
+        return { text: 'RUNNING: QUEUE UNKNOWN, PROGRAM MAY DIFFER', tone: 'amber' };
+      }
       return hamster;
     case 'crank':
       return { text: 'HAND CLOCK: YOU ARE THE CPU', tone: 'gold' };
@@ -60,6 +69,12 @@ function hamsterStatus(scene: Scene, everSeen: boolean): { text: string; tone: s
   }
 }
 
+function sourceLine(info: DisplayInfo): string {
+  if (info.hidden) return PROGRAM_HIDDEN;
+  if (info.withheld) return SOURCE_WITHHELD;
+  return info.text || 'Nothing to show until the wheel reports in.';
+}
+
 function navButton(text: string, target: () => HTMLElement): HTMLElement {
   return h(
     'button',
@@ -76,7 +91,8 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
   const reduced = prefersReducedMotion();
   const relay = createRelay();
   const toasts = toastHost();
-  const pool = createThumbPool();
+  const pool = createThumbPool(reduced);
+  const lit = createFrame();
   const mark = createWheelMark();
   const lockup = createLockup();
   const queueOpen = TURING_WHEEL_ADDRESS !== null;
@@ -86,7 +102,10 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
   let preview: QueuePreview | null = null;
   let previewRequest = 0;
   let readPreview: ((account: WalletSession['address'] | null) => Promise<QueuePreview | null>) | null = null;
+  let readSqueekedIds: ((account: WalletSession['address'], ids: readonly number[]) => Promise<ReadonlySet<number>>) | null = null;
+  let programs: readonly QueuedProgram[] = [];
   let submitting = false;
+  let submission = 0;
   let editor: EditorPanel;
   const mountedAt = performance.now();
 
@@ -116,8 +135,21 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
 
   const queueSync = (): QueueSync => {
     if (!queueOpen) return 'closed';
-    if (reader?.lastSyncAt() != null) return 'live';
+    const synced = reader?.lastSyncAt() ?? null;
+    if (synced !== null) return Date.now() - synced < QUEUE_STALE_MS ? 'live' : 'unreachable';
     return performance.now() - mountedAt < FIRST_READ_GRACE_MS ? 'reading' : 'unreachable';
+  };
+
+  const refreshSqueeked = async (): Promise<void> => {
+    if (!readSqueekedIds) return;
+    if (!session) {
+      queue.setSqueekedIds(new Set());
+      return;
+    }
+    const account = session.address;
+    const ids = programs.slice(-SQUEEKED_CHECK_LIMIT).map((program) => program.id);
+    const found = await readSqueekedIds(account, ids).catch(() => null);
+    if (found && session?.address === account) queue.setSqueekedIds(found);
   };
 
   const refreshTerms = (info: DisplayInfo): void => {
@@ -126,9 +158,11 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
       editor.setTerms('THE CONTRACT SETS THE START CYCLE WHEN YOU SIGN.', false);
       return;
     }
-    const known = (info.reading?.observedAt ?? 0) > 0;
-    const terms = queueTerms(preview, known ? (info.reading?.work ?? null) : null);
-    editor.setTerms(describeTerms(terms, info.reading), terms.kind === 'held');
+    // Under ?sim=1 the clock is invented but the queue and transactions are real, so the clock has no say.
+    const reading = sim ? null : info.reading;
+    const known = (reading?.observedAt ?? 0) > 0;
+    const terms = queueTerms(preview, known ? (reading?.work ?? null) : null);
+    editor.setTerms(describeTerms(terms, reading), terms.kind === 'held');
   };
 
   /** Rejection is the viewer's own choice, so it gets no message. Everything else is told straight. */
@@ -149,11 +183,18 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
     toasts.show(error instanceof Error ? error.message : fallback, 'red');
   };
 
+  const releaseSubmit = (): void => {
+    submission += 1;
+    submitting = false;
+    refreshQueueButton();
+  };
+
   const wallet = createWalletControl((next) => {
     session = next;
     preview = null;
-    refreshQueueButton();
+    releaseSubmit();
     void refreshPreview();
+    void refreshSqueeked();
   }, toasts.show);
 
   const wallCanvas = h('canvas', {
@@ -183,6 +224,11 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
 
   const statusLamp = lamp('dim');
   const statusText = h('span', { class: 'bar__status-text', role: 'status' }, 'ACQUIRING SIGNAL');
+  const flashChip = h(
+    'span',
+    { class: 'chip chip--limit', hidden: true, title: 'This program changes too fast to show safely, so the display is holding frames back.' },
+    'Flash limiter on',
+  );
   const glowGold = h('div', { class: 'wall-glow wall-glow--gold', 'aria-hidden': 'true' });
   const glowBlue = h('div', { class: 'wall-glow wall-glow--blue', 'aria-hidden': 'true' });
   const codeTag = h('span', { class: 'wall__tag' }, 'SOURCE');
@@ -232,13 +278,16 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
     }
     if (now - lastPanelUpdate < 66) return;
     lastPanelUpdate = now;
-    paintGlow(frame, info);
-    setText(codeLine, info.text || 'Nothing to show until the wheel reports in.');
+    wall.copyLevels(lit);
+    paintGlow(lit, info);
+    flashChip.hidden = !wall.isLimiting();
+    setText(codeLine, sourceLine(info));
     codeLine.title = info.text;
-    setText(codeTag, info.segfault ? 'SEGFAULT' : 'SOURCE');
+    setText(codeTag, info.hidden ? 'PROGRAM' : info.segfault ? 'SEGFAULT' : 'SOURCE');
     setData(codeTag, 'fault', info.segfault ? 'true' : 'false');
     codeOpen.disabled = info.text.length === 0;
-    const status = statusOf(info);
+    const sync = queueSync();
+    const status = statusOf(info, sync);
     setText(statusText, status.text);
     setData(statusLamp, 'tone', status.tone);
     setData(document.documentElement, 'scene', info.hamsterScene);
@@ -248,10 +297,10 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
     crank.control.setInvite(info.hamsterScene !== 'live' && info.source === 'hamster');
     liveNudge.hidden = !(info.hamsterScene === 'live' && info.source !== 'hamster');
     queue.update(info.reading?.work ?? 0, (info.reading?.observedAt ?? 0) > 0);
-    queue.setSync(queueSync());
+    queue.setSync(sync);
     refreshTerms(info);
-    editor.monitor(frame, info.title || 'OUTPUT');
-    if (info.source === 'replay') queue.monitor(frame);
+    editor.monitor(lit, info.title || 'OUTPUT');
+    if (info.source === 'replay') queue.monitor(lit);
   };
 
   /** The panel sits in the light of its own display, so what runs on the wall lights the room. */
@@ -263,10 +312,10 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
       if (level > 0) gold += level * level;
       else blue += level * level;
     }
-    const lit = info.scene === 'live' ? 1 : 0.15;
+    const room = info.scene === 'live' ? 1 : 0.15;
     const full = frame.length * 16;
-    glowGold.style.opacity = String(Math.min(1, Math.sqrt(gold / full) * GLOW_GAIN * lit).toFixed(3));
-    glowBlue.style.opacity = String(Math.min(1, Math.sqrt(blue / full) * GLOW_GAIN * lit).toFixed(3));
+    glowGold.style.opacity = String(Math.min(1, Math.sqrt(gold / full) * GLOW_GAIN * room).toFixed(3));
+    glowBlue.style.opacity = String(Math.min(1, Math.sqrt(blue / full) * GLOW_GAIN * room).toFixed(3));
   };
 
   let shownSource: ClockSource = 'hamster';
@@ -349,7 +398,14 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
       return;
     }
     submitting = true;
+    submission += 1;
+    const attempt = submission;
     editor.setQueueState({ kind: 'pending', text: compiled ? 'Sign, then wait for a block' : 'Sign your segfault' });
+    const patience = window.setTimeout(() => {
+      if (attempt !== submission) return;
+      releaseSubmit();
+      toasts.show('No answer from your wallet. If it went through it will show in the queue.', 'amber');
+    }, WALLET_PATIENCE_MS);
     try {
       const { programId, hash } = await active.submit(source);
       toasts.show(`Program #${programId} queued. 512 cycles are yours.`, 'green', {
@@ -359,8 +415,9 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
     } catch (error) {
       reportWalletError(error, 'Transaction failed.');
     }
-    submitting = false;
-    await Promise.all([reader?.refresh(), refreshPreview()]);
+    window.clearTimeout(patience);
+    if (attempt === submission) submitting = false;
+    await Promise.allSettled([reader?.refresh(), refreshPreview()]);
     refreshQueueButton();
   };
 
@@ -376,7 +433,7 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
       reportWalletError(error, 'Squeek failed.');
     }
     queue.setSqueeking(id, false);
-    await reader?.refresh();
+    await Promise.allSettled([reader?.refresh()]);
   };
 
   const soundLabel = h('span', { class: 'switch__label' }, 'Sound off');
@@ -433,6 +490,7 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
       h('h2', { class: 'bar__title' }, 'The Machine'),
       statusText,
       liveNudge,
+      flashChip,
       h('span', { class: 'bar__spacer' }),
       sim ? h('span', { class: 'chip chip--sim' }, 'SIMULATED') : null,
       sources.element,
@@ -454,7 +512,7 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
     { class: 'foot' },
     h('span', {}, 'Community project. Not affiliated with the Squeekchain team.'),
     h('span', { class: 'foot__mid' }, 'One wheel pass, one cycle'),
-    h('span', {}, 'Published telemetry only. Never invented.'),
+    h('span', {}, sim ? 'Simulated clock. The queue and transactions are real.' : 'Published telemetry only. Never invented.'),
   );
 
   root.append(
@@ -505,14 +563,20 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
     const source = decodeProgramRoute(window.location.hash);
     if (source !== null) openShared(source);
   };
+  /** A link is a stranger's text too, so one that does not compile never reaches the page. */
   const openShared = (source: string): void => {
+    if (isWithheld(source)) {
+      toasts.show('That link holds a program that does not compile, so it was not opened.', 'amber');
+      return;
+    }
     editor.load(source);
     machine.setEditorProgram(programFor(source), source);
   };
   const shared = decodeProgramRoute(window.location.hash);
-  if (shared === null) {
+  if (shared === null || isWithheld(shared)) {
     editor.load(STARTER);
     machine.select('hamster');
+    if (shared !== null) openShared(shared);
   } else {
     openShared(shared);
   }
@@ -531,19 +595,24 @@ export function mountApp(root: HTMLElement, sim: boolean, forceCanvas2d: boolean
       const opened = chain.createQueueReader();
       reader = opened;
       readPreview = (account) => chain.previewQueue(account ? { account } : {});
+      readSqueekedIds = (account, ids) => chain.readSqueeked(account, ids);
       void refreshPreview();
       window.setInterval(() => void refreshPreview(), PREVIEW_REFRESH_MS);
       const accept = (next: readonly QueuedProgram[]): void => {
+        programs = next;
         machine.setQueue(next);
         queue.setPrograms(next);
         void refreshPreview();
+        void refreshSqueeked();
       };
       accept(opened.list());
       opened.subscribe(accept);
     })
     .catch(() => toasts.show('Could not load the chain module. Crank still works.', 'red'));
 
-  window.addEventListener('pagehide', () => {
+  // A page kept for the Back button comes back as it left, so its timers must survive.
+  window.addEventListener('pagehide', (event) => {
+    if (event.persisted) return;
     clock?.stop();
     reader?.stop();
   });

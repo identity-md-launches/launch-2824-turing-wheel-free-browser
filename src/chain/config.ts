@@ -4,6 +4,9 @@ import type { Address } from '../types';
 /** Sepolia, verified on Sourcify. While null the queue stays empty and no RPC call is made. */
 export const TURING_WHEEL_ADDRESS: Address | null = '0x1B53382F61DB4bb991aA329d62D04C904E86c20B';
 
+/** The contract has no admin, so this is the only way to hide a program. Display only: it still runs on-chain. */
+export const HIDDEN_PROGRAM_IDS: ReadonlySet<number> = new Set<number>();
+
 export const SEPOLIA_CHAIN_ID = 11_155_111;
 export const SEPOLIA_CHAIN_ID_HEX = '0xaa36a7';
 

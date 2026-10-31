@@ -24,6 +24,7 @@ export function createWalletControl(
   let api: WalletApi | null = null;
   let session: WalletSession | null = null;
   let resolvePick: ((id: string | null) => void) | null = null;
+  let connecting: Promise<WalletSession | null> | null = null;
 
   const label = h('span', {});
   const showIdle = (): void => {
@@ -80,7 +81,7 @@ export function createWalletControl(
       (menu.firstElementChild as HTMLElement | null)?.focus();
     });
 
-  const connect = async (): Promise<WalletSession | null> => {
+  const connectOnce = async (): Promise<WalletSession | null> => {
     if (session) return session;
     if (!api) {
       say('Wallet code is still loading.', 'amber');
@@ -105,6 +106,14 @@ export function createWalletControl(
       if (!isUserRejection(error)) say(error instanceof Error ? error.message : 'Wallet connection failed.', 'red');
       return null;
     }
+  };
+
+  /** Two clicks must not open two wallet prompts, so a second caller joins the first. */
+  const connect = (): Promise<WalletSession | null> => {
+    connecting ??= connectOnce().finally(() => {
+      connecting = null;
+    });
+    return connecting;
   };
 
   const forget = (): void => {

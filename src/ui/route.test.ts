@@ -11,6 +11,12 @@ describe('program routes', () => {
     expect(encodeProgramRoute('>>>???')).toMatch(/^#\/p\/[A-Za-z0-9_-]+$/);
   });
 
+  it('refuses a link far longer than any real program', () => {
+    expect(decodeProgramRoute(encodeProgramRoute('1+'.repeat(384)))).not.toBeNull();
+    expect(decodeProgramRoute(encodeProgramRoute('1+'.repeat(385)))).toBeNull();
+    expect(decodeProgramRoute(encodeProgramRoute('1+'.repeat(500_000)))).toBeNull();
+  });
+
   it('rejects anything that is not a program route', () => {
     expect(decodeProgramRoute('#/')).toBeNull();
     expect(decodeProgramRoute('#/p/')).toBeNull();

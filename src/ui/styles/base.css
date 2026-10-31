@@ -313,6 +313,11 @@ canvas {
   color: var(--pink);
 }
 
+.chip--limit {
+  color: var(--orange);
+  text-transform: uppercase;
+}
+
 .top {
   position: relative;
   z-index: 20;
